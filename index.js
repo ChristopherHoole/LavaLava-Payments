@@ -3,29 +3,24 @@ import express from "express";
 const app = express();
 app.use(express.json({ type: "*/*" }));
 
-// Log every request
 app.use((req, res, next) => {
   console.log("REQ:", req.method, req.originalUrl);
   next();
 });
 
-// Health check
 app.get("/", (req, res) => {
   res.status(200).send("LavaLava Payments OK");
 });
 
-// DEBUG: confirm what token the server is ACTUALLY using at runtime
 app.get("/debug/env", (req, res) => {
   const t = process.env.MP_ACCESS_TOKEN || "";
-  const masked =
-    t.length <= 12 ? t : `${t.slice(0, 6)}...${t.slice(-6)}`;
-
+  const masked = t.length <= 12 ? t : `${t.slice(0, 6)}...${t.slice(-6)}`;
   res.status(200).json({
     ok: true,
     has_token: !!t,
     token_len: t.length,
     token_masked: masked,
-    token_starts_with: t.slice(0, 12), // enough to see which token family it is
+    token_starts_with: t.slice(0, 12),
     payer_email: process.env.MP_PAYER_EMAIL || null
   });
 });
@@ -36,36 +31,42 @@ function mustGetEnv(name) {
   return v;
 }
 
-// -------------------------
-// PIX: Create payment
-// -------------------------
-app.post("/pix/create", async (req, res) => {
+/**
+ * Mercado Pago QR / Orders style create
+ * This creates an "order" with QR that can be used for PIX flow in QR integrations.
+ */
+app.post("/qr/create", async (req, res) => {
   try {
     const accessToken = mustGetEnv("MP_ACCESS_TOKEN");
-    const payerEmail = process.env.MP_PAYER_EMAIL || "test@example.com";
 
+    // We’ll keep it simple: R$1.00 default
     const amount = Number(req.body?.amount ?? 1.0);
-    const description = String(req.body?.description ?? "LavaLava PIX Test R$1");
-    const external_reference = String(req.body?.external_reference ?? "lavalava_test");
+    const title = String(req.body?.title ?? "LavaLava Test R$1");
+    const external_reference = String(req.body?.external_reference ?? "test_washer_1");
 
     if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({ ok: false, error: "Invalid amount" });
     }
 
+    // Merchant Order payload (simple)
     const body = {
-      transaction_amount: amount,
-      description,
-      payment_method_id: "pix",
-      payer: { email: payerEmail },
-      external_reference
+      external_reference,
+      items: [
+        {
+          title,
+          quantity: 1,
+          unit_price: amount,
+          currency_id: "BRL"
+        }
+      ]
     };
 
-    const mpRes = await fetch("https://api.mercadopago.com/v1/payments", {
+    const mpRes = await fetch("https://api.mercadopago.com/merchant_orders", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${accessToken}`,
         "Content-Type": "application/json",
-        "X-Idempotency-Key": `lavalava_${external_reference}_${Date.now()}`
+        "X-Idempotency-Key": `lavalava_order_${external_reference}_${Date.now()}`
       },
       body: JSON.stringify(body)
     });
@@ -73,68 +74,24 @@ app.post("/pix/create", async (req, res) => {
     const data = await mpRes.json();
 
     if (!mpRes.ok) {
-      console.log("MP CREATE ERROR:", mpRes.status, JSON.stringify(data));
-      return res.status(502).json({
-        ok: false,
-        mp_status: mpRes.status,
-        mp_error: data
-      });
-    }
-
-    const tx = data.point_of_interaction?.transaction_data || {};
-    const qr_text = tx.qr_code || null;
-    const qr_base64 = tx.qr_code_base64 || null;
-
-    return res.status(200).json({
-      ok: true,
-      payment_id: data.id,
-      status: data.status,
-      qr_text,
-      qr_base64
-    });
-  } catch (err) {
-    console.log("PIX CREATE FAIL:", err?.message || err);
-    return res.status(500).json({ ok: false, error: err?.message || "server_error" });
-  }
-});
-
-// -------------------------
-// Payment status
-// -------------------------
-app.get("/payment/status", async (req, res) => {
-  try {
-    const accessToken = mustGetEnv("MP_ACCESS_TOKEN");
-    const id = String(req.query?.id || "");
-
-    if (!id) return res.status(400).json({ ok: false, error: "Missing id" });
-
-    const mpRes = await fetch(`https://api.mercadopago.com/v1/payments/${id}`, {
-      method: "GET",
-      headers: { Authorization: `Bearer ${accessToken}` }
-    });
-
-    const data = await mpRes.json();
-
-    if (!mpRes.ok) {
-      console.log("MP STATUS ERROR:", mpRes.status, JSON.stringify(data));
+      console.log("MP ORDER CREATE ERROR:", mpRes.status, JSON.stringify(data));
       return res.status(502).json({ ok: false, mp_status: mpRes.status, mp_error: data });
     }
 
+    // NOTE: Some accounts expose QR info via additional steps.
+    // For now we return the order id + full payload so we can see what MP provides.
     return res.status(200).json({
       ok: true,
-      payment_id: data.id,
+      order_id: data.id,
       status: data.status,
-      status_detail: data.status_detail
+      raw: data
     });
   } catch (err) {
-    console.log("PAYMENT STATUS FAIL:", err?.message || err);
+    console.log("QR CREATE FAIL:", err?.message || err);
     return res.status(500).json({ ok: false, error: err?.message || "server_error" });
   }
 });
 
-// -------------------------
-// Mercado Pago Webhook (log only for now)
-// -------------------------
 app.all("/webhook/mercadopago", (req, res) => {
   console.log("MP WEBHOOK HIT ✅");
   console.log("Method:", req.method);
@@ -143,7 +100,6 @@ app.all("/webhook/mercadopago", (req, res) => {
   res.status(200).send("ok");
 });
 
-// 404 fallback
 app.use((req, res) => {
   console.log("404 FALLBACK ❌", req.method, req.originalUrl);
   res.status(404).send("not found");
