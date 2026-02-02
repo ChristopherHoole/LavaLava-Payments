@@ -3,7 +3,7 @@ import express from "express";
 const app = express();
 app.use(express.json({ type: "*/*" }));
 
-// Log every request (helps debugging)
+// Log every request (debug)
 app.use((req, res, next) => {
   console.log("REQ:", req.method, req.originalUrl);
   next();
@@ -20,15 +20,16 @@ function mustGetEnv(name) {
   return v;
 }
 
-// --- PIX: Create payment (R$ value) ---
+// -------------------------
+// PIX: Create payment
+// -------------------------
 app.post("/pix/create", async (req, res) => {
   try {
     const accessToken = mustGetEnv("MP_ACCESS_TOKEN");
     const payerEmail = process.env.MP_PAYER_EMAIL || "test@example.com";
 
-    // Expect: { "amount": 1.00, "description": "LavaLava Test", "external_reference": "washer_1" }
     const amount = Number(req.body?.amount ?? 1.0);
-    const description = String(req.body?.description ?? "LavaLava PIX Test");
+    const description = String(req.body?.description ?? "LavaLava PIX Test R$1");
     const external_reference = String(req.body?.external_reference ?? "lavalava_test");
 
     if (!Number.isFinite(amount) || amount <= 0) {
@@ -48,7 +49,6 @@ app.post("/pix/create", async (req, res) => {
       headers: {
         Authorization: `Bearer ${accessToken}`,
         "Content-Type": "application/json",
-        // idempotency prevents duplicates if user retries
         "X-Idempotency-Key": `lavalava_${external_reference}_${Date.now()}`
       },
       body: JSON.stringify(body)
@@ -61,17 +61,14 @@ app.post("/pix/create", async (req, res) => {
       return res.status(502).json({ ok: false, mp_status: mpRes.status, mp_error: data });
     }
 
-    const payment_id = data.id;
-    const status = data.status;
-
     const tx = data.point_of_interaction?.transaction_data || {};
     const qr_text = tx.qr_code || null;
     const qr_base64 = tx.qr_code_base64 || null;
 
     return res.status(200).json({
       ok: true,
-      payment_id,
-      status,
+      payment_id: data.id,
+      status: data.status,
       qr_text,
       qr_base64
     });
@@ -81,7 +78,9 @@ app.post("/pix/create", async (req, res) => {
   }
 });
 
-// --- Payment status (polling fallback) ---
+// -------------------------
+// Payment status
+// -------------------------
 app.get("/payment/status", async (req, res) => {
   try {
     const accessToken = mustGetEnv("MP_ACCESS_TOKEN");
@@ -91,9 +90,7 @@ app.get("/payment/status", async (req, res) => {
 
     const mpRes = await fetch(`https://api.mercadopago.com/v1/payments/${id}`, {
       method: "GET",
-      headers: {
-        Authorization: `Bearer ${accessToken}`
-      }
+      headers: { Authorization: `Bearer ${accessToken}` }
     });
 
     const data = await mpRes.json();
@@ -115,21 +112,18 @@ app.get("/payment/status", async (req, res) => {
   }
 });
 
-// --- Mercado Pago Webhook (we just log for now) ---
-app.all("/webhook/mercadopago", async (req, res) => {
-  try {
-    console.log("MP WEBHOOK HIT ✅");
-    console.log("Method:", req.method);
-    console.log("Headers:", JSON.stringify(req.headers));
-    console.log("Body:", JSON.stringify(req.body || {}));
-    res.status(200).send("ok");
-  } catch (err) {
-    console.log("WEBHOOK FAIL:", err?.message || err);
-    res.status(200).send("ok");
-  }
+// -------------------------
+// Mercado Pago Webhook (log only for now)
+// -------------------------
+app.all("/webhook/mercadopago", (req, res) => {
+  console.log("MP WEBHOOK HIT ✅");
+  console.log("Method:", req.method);
+  console.log("Headers:", JSON.stringify(req.headers));
+  console.log("Body:", JSON.stringify(req.body || {}));
+  res.status(200).send("ok");
 });
 
-// Fallback 404
+// 404 fallback
 app.use((req, res) => {
   console.log("404 FALLBACK ❌", req.method, req.originalUrl);
   res.status(404).send("not found");
