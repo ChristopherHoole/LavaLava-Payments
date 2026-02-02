@@ -3,7 +3,7 @@ import express from "express";
 const app = express();
 app.use(express.json({ type: "*/*" }));
 
-// Log every request (debug)
+// Log every request
 app.use((req, res, next) => {
   console.log("REQ:", req.method, req.originalUrl);
   next();
@@ -12,6 +12,22 @@ app.use((req, res, next) => {
 // Health check
 app.get("/", (req, res) => {
   res.status(200).send("LavaLava Payments OK");
+});
+
+// DEBUG: confirm what token the server is ACTUALLY using at runtime
+app.get("/debug/env", (req, res) => {
+  const t = process.env.MP_ACCESS_TOKEN || "";
+  const masked =
+    t.length <= 12 ? t : `${t.slice(0, 6)}...${t.slice(-6)}`;
+
+  res.status(200).json({
+    ok: true,
+    has_token: !!t,
+    token_len: t.length,
+    token_masked: masked,
+    token_starts_with: t.slice(0, 12), // enough to see which token family it is
+    payer_email: process.env.MP_PAYER_EMAIL || null
+  });
 });
 
 function mustGetEnv(name) {
@@ -58,7 +74,11 @@ app.post("/pix/create", async (req, res) => {
 
     if (!mpRes.ok) {
       console.log("MP CREATE ERROR:", mpRes.status, JSON.stringify(data));
-      return res.status(502).json({ ok: false, mp_status: mpRes.status, mp_error: data });
+      return res.status(502).json({
+        ok: false,
+        mp_status: mpRes.status,
+        mp_error: data
+      });
     }
 
     const tx = data.point_of_interaction?.transaction_data || {};
