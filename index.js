@@ -1,109 +1,248 @@
 import express from "express";
+import crypto from "crypto";
 
 const app = express();
-app.use(express.json({ type: "*/*" }));
 
+/**
+ * Mercado Pago sometimes sends different content-types.
+ * This accepts JSON for most cases.
+ */
+app.use(express.json({ type: ["application/json", "application/*+json", "*/*"] }));
+
+/** ----------------------------
+ * Config (Render Env Vars)
+ * ---------------------------- */
+const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN || "";
+const MP_PAYER_EMAIL = process.env.MP_PAYER_EMAIL || "";
+const MP_WEBHOOK_SECRET = process.env.MP_WEBHOOK_SECRET || "";
+
+/**
+ * Optional: set this if you want MP to call a different webhook URL per env
+ * If not set, we default to your current Render URL webhook path.
+ */
+const DEFAULT_WEBHOOK_URL = "https://lavalava-payments.onrender.com/webhook/mercadopago";
+const MP_WEBHOOK_URL = process.env.MP_WEBHOOK_URL || DEFAULT_WEBHOOK_URL;
+
+function maskToken(token) {
+  if (!token) return "";
+  if (token.length <= 10) return token;
+  return `${token.slice(0, 6)}...${token.slice(-6)}`;
+}
+
+function requireToken(res) {
+  if (!MP_ACCESS_TOKEN) {
+    res.status(500).json({ ok: false, error: "MP_ACCESS_TOKEN is missing in environment variables." });
+    return false;
+  }
+  return true;
+}
+
+/** ----------------------------
+ * Simple request logger
+ * ---------------------------- */
 app.use((req, res, next) => {
-  console.log("REQ:", req.method, req.originalUrl);
+  const start = Date.now();
+  res.on("finish", () => {
+    const ms = Date.now() - start;
+    console.log(`REQ: ${req.method} ${req.originalUrl} -> ${res.statusCode} (${ms}ms)`);
+  });
   next();
 });
 
+/** ----------------------------
+ * Health check
+ * ---------------------------- */
 app.get("/", (req, res) => {
   res.status(200).send("LavaLava Payments OK");
 });
 
+/** ----------------------------
+ * Debug env (safe-ish)
+ * ---------------------------- */
 app.get("/debug/env", (req, res) => {
-  const t = process.env.MP_ACCESS_TOKEN || "";
-  const masked = t.length <= 12 ? t : `${t.slice(0, 6)}...${t.slice(-6)}`;
-  res.status(200).json({
+  res.json({
     ok: true,
-    has_token: !!t,
-    token_len: t.length,
-    token_masked: masked,
-    token_starts_with: t.slice(0, 12),
-    payer_email: process.env.MP_PAYER_EMAIL || null
+    has_token: !!MP_ACCESS_TOKEN,
+    token_len: MP_ACCESS_TOKEN ? MP_ACCESS_TOKEN.length : 0,
+    token_masked: maskToken(MP_ACCESS_TOKEN),
+    token_starts_with: MP_ACCESS_TOKEN ? MP_ACCESS_TOKEN.slice(0, 12) : "",
+    payer_email: MP_PAYER_EMAIL || ""
   });
 });
 
-function mustGetEnv(name) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env var: ${name}`);
-  return v;
+/** ----------------------------
+ * Create PIX payment via Checkout API (/v1/payments)
+ * Returns qr_code + qr_code_base64
+ * ---------------------------- */
+async function createPixPayment({ amount, description, external_reference, payer_email }) {
+  const url = "https://api.mercadopago.com/v1/payments";
+
+  // Mercado Pago recommends idempotency key for retries
+  const idempotencyKey = crypto.randomUUID();
+
+  const body = {
+    transaction_amount: Number(amount),
+    description: description || "LavaLava PIX",
+    payment_method_id: "pix",
+    payer: {
+      email: payer_email || MP_PAYER_EMAIL || "test_user_123456@testuser.com"
+    },
+    external_reference: external_reference || undefined,
+    notification_url: MP_WEBHOOK_URL
+  };
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${MP_ACCESS_TOKEN}`,
+      "Content-Type": "application/json",
+      "X-Idempotency-Key": idempotencyKey
+    },
+    body: JSON.stringify(body)
+  });
+
+  const text = await resp.text();
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    json = { raw: text };
+  }
+
+  if (!resp.ok) {
+    const err = new Error(`MP PIX CREATE FAILED: ${resp.status}`);
+    err.status = resp.status;
+    err.mp = json;
+    throw err;
+  }
+
+  // Extract QR data
+  const tx = json?.point_of_interaction?.transaction_data || {};
+  return {
+    payment_id: json.id,
+    status: json.status,
+    status_detail: json.status_detail,
+    qr_code: tx.qr_code || null,
+    qr_code_base64: tx.qr_code_base64 || null,
+    ticket_url: tx.ticket_url || null,
+    raw: json
+  };
 }
 
-/**
- * Mercado Pago QR / Orders style create
- * This creates an "order" with QR that can be used for PIX flow in QR integrations.
- */
-app.post("/qr/create", async (req, res) => {
+/** POST /pix/create */
+app.post("/pix/create", async (req, res) => {
   try {
-    const accessToken = mustGetEnv("MP_ACCESS_TOKEN");
+    if (!requireToken(res)) return;
 
-    // We’ll keep it simple: R$1.00 default
-    const amount = Number(req.body?.amount ?? 1.0);
-    const title = String(req.body?.title ?? "LavaLava Test R$1");
-    const external_reference = String(req.body?.external_reference ?? "test_washer_1");
+    const { amount, description, external_reference, payer_email } = req.body || {};
 
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return res.status(400).json({ ok: false, error: "Invalid amount" });
+    if (amount === undefined || amount === null || Number.isNaN(Number(amount))) {
+      return res.status(400).json({ ok: false, error: "amount is required and must be a number" });
     }
 
-    // Merchant Order payload (simple)
-    const body = {
+    const result = await createPixPayment({
+      amount,
+      description,
       external_reference,
-      items: [
-        {
-          title,
-          quantity: 1,
-          unit_price: amount,
-          currency_id: "BRL"
-        }
-      ]
-    };
-
-    const mpRes = await fetch("https://api.mercadopago.com/merchant_orders", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-        "X-Idempotency-Key": `lavalava_order_${external_reference}_${Date.now()}`
-      },
-      body: JSON.stringify(body)
+      payer_email
     });
 
-    const data = await mpRes.json();
-
-    if (!mpRes.ok) {
-      console.log("MP ORDER CREATE ERROR:", mpRes.status, JSON.stringify(data));
-      return res.status(502).json({ ok: false, mp_status: mpRes.status, mp_error: data });
-    }
-
-    // NOTE: Some accounts expose QR info via additional steps.
-    // For now we return the order id + full payload so we can see what MP provides.
-    return res.status(200).json({
-      ok: true,
-      order_id: data.id,
-      status: data.status,
-      raw: data
+    return res.status(200).json({ ok: true, ...result });
+  } catch (e) {
+    console.error("MP PIX CREATE ERROR:", e?.status || "", e?.mp || e?.message || e);
+    return res.status(500).json({
+      ok: false,
+      error: "pix_create_failed",
+      details: e?.mp || e?.message || String(e)
     });
-  } catch (err) {
-    console.log("QR CREATE FAIL:", err?.message || err);
-    return res.status(500).json({ ok: false, error: err?.message || "server_error" });
   }
 });
 
-app.all("/webhook/mercadopago", (req, res) => {
-  console.log("MP WEBHOOK HIT ✅");
-  console.log("Method:", req.method);
-  console.log("Headers:", JSON.stringify(req.headers));
-  console.log("Body:", JSON.stringify(req.body || {}));
-  res.status(200).send("ok");
+/**
+ * Alias so your existing test that calls /qr/create still works.
+ * POST /qr/create -> same as /pix/create
+ */
+app.post("/qr/create", async (req, res) => {
+  // Just forward to the same handler logic:
+  req.url = "/pix/create";
+  app._router.handle(req, res, () => {});
 });
 
+/** GET /pix/status/:id */
+app.get("/pix/status/:id", async (req, res) => {
+  try {
+    if (!requireToken(res)) return;
+
+    const paymentId = req.params.id;
+    if (!paymentId) return res.status(400).json({ ok: false, error: "payment id required" });
+
+    const url = `https://api.mercadopago.com/v1/payments/${encodeURIComponent(paymentId)}`;
+
+    const resp = await fetch(url, {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${MP_ACCESS_TOKEN}`
+      }
+    });
+
+    const text = await resp.text();
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      json = { raw: text };
+    }
+
+    if (!resp.ok) {
+      return res.status(resp.status).json({ ok: false, error: "mp_status_failed", details: json });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      id: json.id,
+      status: json.status,
+      status_detail: json.status_detail,
+      external_reference: json.external_reference || null,
+      transaction_amount: json.transaction_amount,
+      payment_method_id: json.payment_method_id,
+      payer: json.payer || null,
+      raw: json
+    });
+  } catch (e) {
+    console.error("MP STATUS ERROR:", e?.message || e);
+    return res.status(500).json({ ok: false, error: "status_check_failed", details: e?.message || String(e) });
+  }
+});
+
+/**
+ * Webhook receiver
+ * Mercado Pago will POST here for updates
+ * For now: log + 200 OK
+ *
+ * (Later we can add signature verification if you want it strict)
+ */
+app.post("/webhook/mercadopago", async (req, res) => {
+  try {
+    console.log("MP WEBHOOK RECEIVED");
+    console.log("Headers:", JSON.stringify(req.headers));
+    console.log("Body:", JSON.stringify(req.body));
+
+    // Always acknowledge quickly
+    return res.status(200).send("OK");
+  } catch (e) {
+    console.error("WEBHOOK ERROR:", e?.message || e);
+    return res.status(200).send("OK");
+  }
+});
+
+/** Fallback */
 app.use((req, res) => {
-  console.log("404 FALLBACK ❌", req.method, req.originalUrl);
-  res.status(404).send("not found");
+  res.status(404).json({ ok: false, error: "not_found", path: req.originalUrl });
 });
 
+/** Listen */
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Listening on ${port}`));
+app.listen(port, () => {
+  console.log(`Listening on ${port}`);
+  console.log(`Webhook URL: ${MP_WEBHOOK_URL}`);
+});
